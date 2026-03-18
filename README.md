@@ -5,7 +5,11 @@
 [![License](https://img.shields.io/github/license/code-cargo/cargowall-action)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/code-cargo/cargowall-action)](https://github.com/code-cargo/cargowall-action/releases)
 
-Secure your GitHub Actions workflows with eBPF-based network egress filtering. CargoWall uses Linux Traffic Control (TC) eBPF programs to filter outbound network connections, preventing supply chain attacks and data exfiltration.
+The official GitHub Action for [CargoWall](https://github.com/code-cargo/cargowall) — an eBPF-based network firewall for GitHub Actions runners that monitors and controls outbound connections during CI/CD runs.
+
+Secure your GitHub Actions workflows with eBPF-based network egress filtering. Prevent supply chain attacks, block data exfiltration, and control outbound connections at the kernel level.
+
+For concepts, architecture, and platform capabilities, see the [main CargoWall repository](https://github.com/code-cargo/cargowall).
 
 ## Features
 
@@ -42,6 +46,9 @@ on: [push, pull_request]
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
@@ -58,6 +65,8 @@ jobs:
       - run: npm run build
       - run: npm test
 ```
+
+> **Note:** To connect to the [CodeCargo platform](https://www.codecargo.com) via `api-url`, your job needs these minimum permissions: `id-token: write` (OIDC authentication), `actions: read` (correlate network events to steps), and `contents: read`.
 
 ### With Docker Support
 
@@ -268,6 +277,16 @@ If DNS queries are timing out:
 1. Ensure Docker is running before the action
 2. CargoWall automatically configures Docker DNS
 3. Check `/etc/docker/daemon.json` was updated
+
+## CodeCargo Platform
+
+Don't want to manage policies in workflow YAML? Sign up for the [CodeCargo platform](https://www.codecargo.com) to create and assign CargoWall policies from a centralized dashboard — with hierarchical overrides at the org, repo, workflow, and job level. Just keep this action in your workflow and manage everything else from the UI.
+
+## Documentation
+
+* [CargoWall documentation](https://docs.codecargo.com/concepts/cargowall)
+* [CargoWall repository](https://github.com/code-cargo/cargowall) — architecture, concepts, and how it works
+* [CodeCargo platform](https://www.codecargo.com) — centralized policy management and enterprise features
 
 ## License
 
