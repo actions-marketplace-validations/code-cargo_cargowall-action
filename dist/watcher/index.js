@@ -25,6 +25,19 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 // src/watcher.ts
 var import_fs = require("fs");
 var path = __toESM(require("path"));
+
+// src/blocks.ts
+var TIMESTAMP_REGEX = /^\uFEFF?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)/;
+function parseBlockFilename(file) {
+  const dotIdx = file.lastIndexOf(".");
+  const base = dotIdx >= 0 ? file.substring(0, dotIdx) : file;
+  const underIdx = base.indexOf("_");
+  if (underIdx < 0) return null;
+  const stepId = base.substring(underIdx + 1);
+  return stepId || null;
+}
+
+// src/watcher.ts
 var blocksDir = process.argv[2];
 var outputFile = process.argv[3];
 var logFile = "/tmp/cargowall-watcher.log";
@@ -34,34 +47,38 @@ async function log(msg) {
   });
 }
 var seen = /* @__PURE__ */ new Set();
-var tsRegex = /^\uFEFF?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)/;
+var seenStepIds = /* @__PURE__ */ new Set();
 log(`watcher started: blocks=${blocksDir} output=${outputFile}`);
 async function poll() {
   try {
     const files = await import_fs.promises.readdir(blocksDir);
     for (const file of files) {
       if (seen.has(file)) continue;
-      const dotIdx = file.lastIndexOf(".");
-      const base = dotIdx >= 0 ? file.substring(0, dotIdx) : file;
-      const underIdx = base.indexOf("_");
-      if (underIdx < 0) {
+      const stepId = parseBlockFilename(file);
+      if (!stepId || seenStepIds.has(stepId)) {
         seen.add(file);
         continue;
       }
-      const stepId = base.substring(underIdx + 1);
       try {
-        const content = await import_fs.promises.readFile(path.join(blocksDir, file), "utf8");
-        const firstLine = content.split("\n")[0] || "";
-        if (!firstLine) {
-          continue;
-        }
-        seen.add(file);
-        const match = firstLine.match(tsRegex);
-        if (match) {
-          log(`timestamp: stepId=${stepId} ts=${match[1]}`);
-          await import_fs.promises.appendFile(outputFile, JSON.stringify({ id: stepId, ts: match[1] }) + "\n");
-        } else {
-          log(`no timestamp match in ${file}: ${firstLine.substring(0, 80)}`);
+        const fh = await import_fs.promises.open(path.join(blocksDir, file), "r");
+        try {
+          const buf = Buffer.alloc(256);
+          const { bytesRead } = await fh.read(buf, 0, 256, 0);
+          if (bytesRead === 0) {
+            continue;
+          }
+          const firstLine = buf.toString("utf8", 0, bytesRead).split("\n")[0] || "";
+          const match = firstLine.match(TIMESTAMP_REGEX);
+          if (match) {
+            seen.add(file);
+            seenStepIds.add(stepId);
+            log(`timestamp: stepId=${stepId} ts=${match[1]}`);
+            await import_fs.promises.appendFile(outputFile, JSON.stringify({ id: stepId, ts: match[1] }) + "\n");
+          } else {
+            log(`no timestamp match in ${file}, will retry`);
+          }
+        } finally {
+          await fh.close();
         }
       } catch (err) {
         log(`read error for ${file}: ${err}`);
@@ -71,5 +88,8 @@ async function poll() {
     log(`readdir error: ${err}`);
   }
 }
-setInterval(poll, 200);
-poll();
+async function startPolling() {
+  await poll();
+  setTimeout(startPolling, 200);
+}
+startPolling();

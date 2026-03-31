@@ -6,7 +6,7 @@ import { promises as fs } from 'fs'
 import { closeSync, openSync } from 'fs'
 import * as path from 'path'
 import { detectDnsUpstream } from './dns'
-import { findDiagDir, parseJobPlan } from './diag'
+import { findDiagDir, parseExecutedSteps, parseJobPlan } from './diag'
 
 const AUDIT_LOG = '/tmp/cargowall-audit.json'
 const CARGOWALL_LOG = '/tmp/cargowall.log'
@@ -52,6 +52,59 @@ export async function start(): Promise<{ supported: boolean; pid: number | null 
 
   core.startGroup('Starting CargoWall Firewall')
 
+  // Start the block file watcher as early as possible.
+  // Block files get cleaned up during the run, so the watcher must capture
+  // timestamps in real-time. Starting it before binary download gives it
+  // the full setup duration (~8-10s) to capture earlier steps' block files.
+  try {
+    const diagDir = await findDiagDir()
+    if (diagDir) {
+      core.saveState('diag-dir', diagDir)
+
+      // Try to parse and persist the step plan if available
+      try {
+        const stepPlan = await parseJobPlan(diagDir)
+        if (Object.keys(stepPlan).length > 0) {
+          await fs.writeFile(STEP_PLAN_FILE, JSON.stringify(stepPlan))
+          core.info(`Step plan: ${Object.keys(stepPlan).length} steps mapped`)
+        } else {
+          core.info('Step plan is empty or unavailable; proceeding without mapped steps.')
+        }
+      } catch (planErr) {
+        core.info(`Unable to parse step plan: ${planErr}`)
+      }
+
+      // Save the current step name so the post step knows where CW started.
+      // This must run regardless of whether the plan parsed successfully,
+      // because buildStepsFromDiag needs it even without a plan.
+      try {
+        const executedSoFar = await parseExecutedSteps(diagDir)
+        if (executedSoFar.length > 0) {
+          core.saveState('cw-step-name', executedSoFar[executedSoFar.length - 1])
+        }
+      } catch {
+        // Worker log may not be available yet — not critical
+      }
+
+      // Spawn watcher as detached node process.
+      // Must run whenever diagDir exists so timestamps are available
+      // even if the step plan is empty or could not be parsed.
+      const blocksDir = path.join(diagDir, 'blocks')
+      const watcherScript = path.join(__dirname, '..', 'watcher', 'index.js')
+      const watcher = spawn('node', [watcherScript, blocksDir, STEP_TIMESTAMPS_FILE], {
+        detached: true,
+        stdio: 'ignore',
+      })
+      watcher.unref()
+      if (watcher.pid) {
+        core.saveState('watcher-pid', String(watcher.pid))
+        core.info(`Blocks watcher started (PID: ${watcher.pid})`)
+      }
+    }
+  } catch (err) {
+    core.info(`Sub-second timestamp setup: ${err}`)
+  }
+
   // Auto-detect DNS upstream before we overwrite resolv.conf
   const dnsResult = await detectDnsUpstream(core.getInput('dns-upstream'))
   const dnsUpstream = dnsResult.primary
@@ -93,8 +146,7 @@ export async function start(): Promise<{ supported: boolean; pid: number | null 
     args.push(`--api-url=${apiUrl}`)
     args.push(`--job-key=${github.context.job}`)
     try {
-      const audience = core.getInput('api-audience') || 'codecargo'
-      const idToken = await core.getIDToken(audience)
+      const idToken = await core.getIDToken('codecargo')
       args.push(`--token=${idToken}`)
     } catch (error) {
       core.warning(`Failed to get OIDC token for policy fetch: ${error}. Falling back to env/file config.`)
@@ -238,33 +290,6 @@ export async function start(): Promise<{ supported: boolean; pid: number | null 
 
   // Also write PID file for compatibility
   await fs.writeFile('/tmp/cargowall.pid', String(pid))
-
-  // --- Sub-second step timestamp collection ---
-  try {
-    const diagDir = await findDiagDir()
-    if (diagDir) {
-      const stepPlan = await parseJobPlan(diagDir)
-      if (Object.keys(stepPlan).length > 0) {
-        await fs.writeFile(STEP_PLAN_FILE, JSON.stringify(stepPlan))
-        core.info(`Step plan: ${Object.keys(stepPlan).length} steps mapped`)
-
-        // Spawn watcher as detached node process
-        const blocksDir = path.join(diagDir, 'blocks')
-        const watcherScript = path.join(__dirname, '..', 'watcher', 'index.js')
-        const watcher = spawn('node', [watcherScript, blocksDir, STEP_TIMESTAMPS_FILE], {
-          detached: true,
-          stdio: 'ignore',
-        })
-        watcher.unref()
-        if (watcher.pid) {
-          core.saveState('watcher-pid', String(watcher.pid))
-          core.info(`Blocks watcher started (PID: ${watcher.pid})`)
-        }
-      }
-    }
-  } catch (err) {
-    core.info(`Sub-second timestamp setup: ${err}`)
-  }
 
   core.endGroup()
 

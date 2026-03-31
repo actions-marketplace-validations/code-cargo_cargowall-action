@@ -22316,7 +22316,7 @@ var JSONStringify = (value, replacer, space) => {
   const convertedToCustomJSON = originalStringify(
     value,
     (key, value2) => {
-      const isNoise = typeof value2 === "string" && Boolean(value2.match(noiseValue));
+      const isNoise = typeof value2 === "string" && noiseValue.test(value2);
       if (isNoise) return value2.toString() + "n";
       if (typeof value2 === "bigint") return value2.toString() + "n";
       if (typeof replacer === "function") return replacer(key, value2);
@@ -22332,11 +22332,28 @@ var JSONStringify = (value, replacer, space) => {
   const denoisedJSON = processedJSON.replace(noiseStringify, "$1$2$3");
   return denoisedJSON;
 };
-var isContextSourceSupported = () => JSON.parse("1", (_, __, context3) => !!context3 && context3.source === "1");
+var featureCache = /* @__PURE__ */ new Map();
+var isContextSourceSupported = () => {
+  const parseFingerprint = JSON.parse.toString();
+  if (featureCache.has(parseFingerprint)) {
+    return featureCache.get(parseFingerprint);
+  }
+  try {
+    const result = JSON.parse(
+      "1",
+      (_, __, context3) => !!context3?.source && context3.source === "1"
+    );
+    featureCache.set(parseFingerprint, result);
+    return result;
+  } catch {
+    featureCache.set(parseFingerprint, false);
+    return false;
+  }
+};
 var convertMarkedBigIntsReviver = (key, value, context3, userReviver) => {
-  const isCustomFormatBigInt = typeof value === "string" && value.match(customFormat);
+  const isCustomFormatBigInt = typeof value === "string" && customFormat.test(value);
   if (isCustomFormatBigInt) return BigInt(value.slice(0, -1));
-  const isNoiseValue = typeof value === "string" && value.match(noiseValue);
+  const isNoiseValue = typeof value === "string" && noiseValue.test(value);
   if (isNoiseValue) return value.slice(0, -1);
   if (typeof userReviver !== "function") return value;
   return userReviver(key, value, context3);
@@ -22362,7 +22379,7 @@ var JSONParse = (text, reviver) => {
     stringsOrLargeNumbers,
     (text2, digits, fractional, exponential) => {
       const isString = text2[0] === '"';
-      const isNoise = isString && Boolean(text2.match(noiseValueWithQuotes));
+      const isNoise = isString && noiseValueWithQuotes.test(text2);
       if (isNoise) return text2.substring(0, text2.length - 1) + 'n"';
       const isFractionalOrExponential = fractional || exponential;
       const isLessThanMaxSafeInt = digits && (digits.length < MAX_DIGITS || digits.length === MAX_DIGITS && digits <= MAX_INT);
@@ -25633,7 +25650,9 @@ async function detectDnsUpstream(userInput) {
 var import_fs5 = require("fs");
 var path5 = __toESM(require("path"));
 async function findDiagDir() {
+  const versionedCandidates = await findVersionedDiagDirs();
   const candidates = [
+    ...versionedCandidates,
     "/home/runner/actions-runner/cached/_diag",
     "/home/runner/actions-runner/_diag"
   ];
@@ -25657,6 +25676,17 @@ async function findDiagDir() {
   } catch {
   }
   return null;
+}
+async function findVersionedDiagDirs() {
+  const results = [];
+  try {
+    const entries = await import_fs5.promises.readdir("/home/runner/actions-runner/cached", { withFileTypes: true });
+    for (const e of entries.filter((e2) => e2.isDirectory() && /^\d/.test(e2.name))) {
+      results.push(path5.join("/home/runner/actions-runner/cached", e.name, "_diag"));
+    }
+  } catch {
+  }
+  return results;
 }
 async function parseJobPlan(diagDir) {
   const stepIdToName = {};
@@ -25711,6 +25741,22 @@ async function parseJobPlan(diagDir) {
   }
   return stepIdToName;
 }
+async function parseExecutedSteps(diagDir) {
+  const files = await import_fs5.promises.readdir(diagDir);
+  const workerLogFiles = files.filter((f) => f.startsWith("Worker_")).sort();
+  if (workerLogFiles.length === 0) return [];
+  const workerContent = await import_fs5.promises.readFile(
+    path5.join(diagDir, workerLogFiles[workerLogFiles.length - 1]),
+    "utf8"
+  );
+  const names = [];
+  const regex = /Processing step: DisplayName='([^']+)'/g;
+  let match;
+  while ((match = regex.exec(workerContent)) !== null) {
+    names.push(match[1]);
+  }
+  return names;
+}
 
 // src/start.ts
 var AUDIT_LOG = "/tmp/cargowall-audit.json";
@@ -25754,6 +25800,43 @@ async function start() {
   const allowExistingConnections = getInput("allow-existing-connections") !== "false";
   const auditSummary = getInput("audit-summary") !== "false";
   startGroup("Starting CargoWall Firewall");
+  try {
+    const diagDir = await findDiagDir();
+    if (diagDir) {
+      saveState("diag-dir", diagDir);
+      try {
+        const stepPlan = await parseJobPlan(diagDir);
+        if (Object.keys(stepPlan).length > 0) {
+          await import_fs6.promises.writeFile(STEP_PLAN_FILE, JSON.stringify(stepPlan));
+          info(`Step plan: ${Object.keys(stepPlan).length} steps mapped`);
+        } else {
+          info("Step plan is empty or unavailable; proceeding without mapped steps.");
+        }
+      } catch (planErr) {
+        info(`Unable to parse step plan: ${planErr}`);
+      }
+      try {
+        const executedSoFar = await parseExecutedSteps(diagDir);
+        if (executedSoFar.length > 0) {
+          saveState("cw-step-name", executedSoFar[executedSoFar.length - 1]);
+        }
+      } catch {
+      }
+      const blocksDir = path6.join(diagDir, "blocks");
+      const watcherScript = path6.join(__dirname, "..", "watcher", "index.js");
+      const watcher = (0, import_child_process.spawn)("node", [watcherScript, blocksDir, STEP_TIMESTAMPS_FILE], {
+        detached: true,
+        stdio: "ignore"
+      });
+      watcher.unref();
+      if (watcher.pid) {
+        saveState("watcher-pid", String(watcher.pid));
+        info(`Blocks watcher started (PID: ${watcher.pid})`);
+      }
+    }
+  } catch (err) {
+    info(`Sub-second timestamp setup: ${err}`);
+  }
   const dnsResult = await detectDnsUpstream(getInput("dns-upstream"));
   const dnsUpstream = dnsResult.primary;
   const args = ["start", "--github-action", `--dns-upstream=${dnsUpstream}`];
@@ -25783,8 +25866,7 @@ async function start() {
     args.push(`--api-url=${apiUrl}`);
     args.push(`--job-key=${context2.job}`);
     try {
-      const audience = getInput("api-audience") || "codecargo";
-      const idToken = await getIDToken(audience);
+      const idToken = await getIDToken("codecargo");
       args.push(`--token=${idToken}`);
     } catch (error2) {
       warning(`Failed to get OIDC token for policy fetch: ${error2}. Falling back to env/file config.`);
@@ -25888,29 +25970,6 @@ async function start() {
   setOutput("supported", "true");
   saveState("cargowall-pid", String(pid));
   await import_fs6.promises.writeFile("/tmp/cargowall.pid", String(pid));
-  try {
-    const diagDir = await findDiagDir();
-    if (diagDir) {
-      const stepPlan = await parseJobPlan(diagDir);
-      if (Object.keys(stepPlan).length > 0) {
-        await import_fs6.promises.writeFile(STEP_PLAN_FILE, JSON.stringify(stepPlan));
-        info(`Step plan: ${Object.keys(stepPlan).length} steps mapped`);
-        const blocksDir = path6.join(diagDir, "blocks");
-        const watcherScript = path6.join(__dirname, "..", "watcher", "index.js");
-        const watcher = (0, import_child_process.spawn)("node", [watcherScript, blocksDir, STEP_TIMESTAMPS_FILE], {
-          detached: true,
-          stdio: "ignore"
-        });
-        watcher.unref();
-        if (watcher.pid) {
-          saveState("watcher-pid", String(watcher.pid));
-          info(`Blocks watcher started (PID: ${watcher.pid})`);
-        }
-      }
-    }
-  } catch (err) {
-    info(`Sub-second timestamp setup: ${err}`);
-  }
   endGroup();
   notice("CargoWall firewall is active. Network egress is being filtered.");
   if (debug2) {

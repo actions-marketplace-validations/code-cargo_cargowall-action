@@ -1,13 +1,17 @@
 import { promises as fs } from 'fs'
 import * as path from 'path'
+import { scanBlocksDir } from './blocks'
 
 /**
  * Find the runner's _diag directory which contains Worker logs and blocks/.
  * Returns the path or null if not found.
  */
 export async function findDiagDir(): Promise<string | null> {
-  // Check known paths first
+  // Check known paths first. The versioned path (e.g. cached/2.333.1/_diag) takes
+  // priority — some runner images have a cached/_diag without blocks/.
+  const versionedCandidates = await findVersionedDiagDirs()
   const candidates = [
+    ...versionedCandidates,
     '/home/runner/actions-runner/cached/_diag',
     '/home/runner/actions-runner/_diag',
   ]
@@ -32,6 +36,20 @@ export async function findDiagDir(): Promise<string | null> {
   } catch { /* continue */ }
 
   return null
+}
+
+/**
+ * Find versioned _diag directories like /home/runner/actions-runner/cached/2.333.1/_diag.
+ */
+async function findVersionedDiagDirs(): Promise<string[]> {
+  const results: string[] = []
+  try {
+    const entries = await fs.readdir('/home/runner/actions-runner/cached', { withFileTypes: true })
+    for (const e of entries.filter(e => e.isDirectory() && /^\d/.test(e.name))) {
+      results.push(path.join('/home/runner/actions-runner/cached', e.name, '_diag'))
+    }
+  } catch { /* continue */ }
+  return results
 }
 
 /**
@@ -104,4 +122,40 @@ export async function parseJobPlan(diagDir: string): Promise<Record<string, stri
   }
 
   return stepIdToName
+}
+
+/**
+ * Scan the blocks directory for step timestamps.
+ * Used to pick up entries the watcher missed (e.g. post steps that appeared
+ * after the watcher's last poll). Only recent block files survive cleanup.
+ */
+export async function scanBlocks(diagDir: string): Promise<Array<{ id: string; ts: string }>> {
+  return scanBlocksDir(path.join(diagDir, 'blocks'))
+}
+
+/**
+ * Parse the Worker log for runtime step execution entries to get ALL step names
+ * including post steps (which are not in the job plan).
+ * Scans for "Processing step: DisplayName='<name>'" lines written by the runner's
+ * Trace.Info for every step as it executes.
+ * Returns an ordered list of display names in execution order.
+ */
+export async function parseExecutedSteps(diagDir: string): Promise<string[]> {
+  const files = await fs.readdir(diagDir)
+  const workerLogFiles = files.filter(f => f.startsWith('Worker_')).sort()
+  if (workerLogFiles.length === 0) return []
+
+  const workerContent = await fs.readFile(
+    path.join(diagDir, workerLogFiles[workerLogFiles.length - 1]),
+    'utf8'
+  )
+
+  const names: string[] = []
+  const regex = /Processing step: DisplayName='([^']+)'/g
+  let match
+  while ((match = regex.exec(workerContent)) !== null) {
+    names.push(match[1])
+  }
+
+  return names
 }

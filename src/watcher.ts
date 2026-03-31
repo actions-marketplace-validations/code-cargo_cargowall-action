@@ -1,5 +1,6 @@
 import { promises as fs } from 'fs'
 import * as path from 'path'
+import { parseBlockFilename, TIMESTAMP_REGEX } from './blocks'
 
 const blocksDir = process.argv[2]
 const outputFile = process.argv[3]
@@ -11,7 +12,7 @@ async function log(msg: string) {
 }
 
 const seen = new Set<string>()
-const tsRegex = /^\uFEFF?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)/
+const seenStepIds = new Set<string>()
 
 log(`watcher started: blocks=${blocksDir} output=${outputFile}`)
 
@@ -21,31 +22,35 @@ async function poll() {
     for (const file of files) {
       if (seen.has(file)) continue
 
-      // Extract step ID from filename: {jobId}_{stepId}.{page}
-      const dotIdx = file.lastIndexOf('.')
-      const base = dotIdx >= 0 ? file.substring(0, dotIdx) : file
-      const underIdx = base.indexOf('_')
-      if (underIdx < 0) {
+      const stepId = parseBlockFilename(file)
+      if (!stepId || seenStepIds.has(stepId)) {
         seen.add(file)
         continue
       }
-      const stepId = base.substring(underIdx + 1)
 
-      // Read first line for sub-second timestamp
       try {
-        const content = await fs.readFile(path.join(blocksDir, file), 'utf8')
-        const firstLine = content.split('\n')[0] || ''
-        if (!firstLine) {
-          // File exists but is empty — retry next poll (runner hasn't written yet)
-          continue
-        }
-        seen.add(file)
-        const match = firstLine.match(tsRegex)
-        if (match) {
-          log(`timestamp: stepId=${stepId} ts=${match[1]}`)
-          await fs.appendFile(outputFile, JSON.stringify({ id: stepId, ts: match[1] }) + '\n')
-        } else {
-          log(`no timestamp match in ${file}: ${firstLine.substring(0, 80)}`)
+        const fh = await fs.open(path.join(blocksDir, file), 'r')
+        try {
+          const buf = Buffer.alloc(256)
+          const { bytesRead } = await fh.read(buf, 0, 256, 0)
+          if (bytesRead === 0) {
+            // File exists but is empty — retry next poll (runner hasn't written yet)
+            continue
+          }
+          const firstLine = buf.toString('utf8', 0, bytesRead).split('\n')[0] || ''
+          const match = firstLine.match(TIMESTAMP_REGEX)
+          if (match) {
+            seen.add(file)
+            seenStepIds.add(stepId)
+            log(`timestamp: stepId=${stepId} ts=${match[1]}`)
+            await fs.appendFile(outputFile, JSON.stringify({ id: stepId, ts: match[1] }) + '\n')
+          } else {
+            // No match — runner may still be writing the first line.
+            // Don't add to seen so we retry on the next poll.
+            log(`no timestamp match in ${file}, will retry`)
+          }
+        } finally {
+          await fh.close()
         }
       } catch (err) {
         // File may have been deleted or not yet readable — retry next poll
@@ -57,6 +62,10 @@ async function poll() {
   }
 }
 
-// Poll every 200ms
-setInterval(poll, 200)
-poll()
+// Poll every 200ms in a non-reentrant loop
+async function startPolling() {
+  await poll()
+  setTimeout(startPolling, 200)
+}
+
+startPolling()
